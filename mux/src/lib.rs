@@ -137,11 +137,170 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
     histogram!("send_actions_to_mux.rate").record(1.);
 }
 
+/// Tracks DEC private mode 2026 (Synchronized Output) for
+/// `parse_buffered_data`, accumulating parsed actions and deciding
+/// when a batch of them should be applied to the pane.
+///
+/// While a synchronized output block is active, actions are held so
+/// that the block can be applied to the terminal model in a single
+/// `Pane::perform_actions` call, which makes it atomic from the
+/// perspective of the renderer.
+#[derive(Default)]
+struct SyncOutputBatcher {
+    actions: Vec<Action>,
+    holding: bool,
+}
+
+impl SyncOutputBatcher {
+    /// Accumulate an action, returning a batch of actions that
+    /// should be applied to the pane now, if any.
+    fn ingest(&mut self, action: Action) -> Option<Vec<Action>> {
+        let mut batch = None;
+        let mut flush_after = false;
+        match &action {
+            Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::SynchronizedOutput,
+            )))) => {
+                self.holding = true;
+
+                // Flush prior actions
+                batch = self.take();
+            }
+            Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::SynchronizedOutput,
+            )))) => {
+                self.holding = false;
+                flush_after = true;
+            }
+            Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
+                self.holding = false;
+                flush_after = true;
+            }
+            _ => {}
+        };
+        action.append_to(&mut self.actions);
+
+        if flush_after {
+            batch = self.take();
+        }
+        batch
+    }
+
+    /// Hand back whatever has accumulated, if anything.
+    fn take(&mut self) -> Option<Vec<Action>> {
+        if self.actions.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.actions))
+        }
+    }
+
+    fn is_holding(&self) -> bool {
+        self.holding
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.actions.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod sync_output_batcher_tests {
+    use super::*;
+
+    fn print(s: &str) -> Action {
+        Action::PrintString(s.to_string())
+    }
+
+    fn sync_start() -> Action {
+        Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::SynchronizedOutput,
+        ))))
+    }
+
+    fn sync_end() -> Action {
+        Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::SynchronizedOutput,
+        ))))
+    }
+
+    fn soft_reset() -> Action {
+        Action::CSI(CSI::Device(Box::new(Device::SoftReset)))
+    }
+
+    /// Feed all of `input` through the batcher, returning the batches
+    /// that it asked to flush along the way.
+    fn ingest_all(batcher: &mut SyncOutputBatcher, input: Vec<Action>) -> Vec<Vec<Action>> {
+        input
+            .into_iter()
+            .filter_map(|action| batcher.ingest(action))
+            .collect()
+    }
+
+    #[test]
+    fn accumulates_outside_sync() {
+        let mut batcher = SyncOutputBatcher::default();
+        let batches = ingest_all(&mut batcher, vec![print("hello"), print("world")]);
+        assert_eq!(batches, Vec::<Vec<Action>>::new());
+        assert!(batcher.has_pending());
+        assert!(!batcher.is_holding());
+        assert_eq!(batcher.take(), Some(vec![print("hello"), print("world")]));
+        assert!(!batcher.has_pending());
+        assert_eq!(batcher.take(), None);
+    }
+
+    #[test]
+    fn prefix_is_flushed_when_sync_begins() {
+        let mut batcher = SyncOutputBatcher::default();
+        let batches = ingest_all(
+            &mut batcher,
+            vec![print("prefix"), sync_start(), print("body"), sync_end()],
+        );
+        assert_eq!(
+            batches,
+            vec![
+                vec![print("prefix")],
+                vec![sync_start(), print("body"), sync_end()],
+            ]
+        );
+        assert!(!batcher.is_holding());
+        assert!(!batcher.has_pending());
+    }
+
+    #[test]
+    fn holds_across_ingest_until_release() {
+        let mut batcher = SyncOutputBatcher::default();
+        let batches = ingest_all(&mut batcher, vec![sync_start(), print("body")]);
+        assert_eq!(batches, Vec::<Vec<Action>>::new());
+        assert!(batcher.is_holding());
+
+        let batches = ingest_all(&mut batcher, vec![print("more"), sync_end()]);
+        assert_eq!(
+            batches,
+            vec![vec![sync_start(), print("body"), print("more"), sync_end()]]
+        );
+        assert!(!batcher.is_holding());
+    }
+
+    #[test]
+    fn soft_reset_releases_hold() {
+        let mut batcher = SyncOutputBatcher::default();
+        let batches = ingest_all(
+            &mut batcher,
+            vec![sync_start(), print("body"), soft_reset()],
+        );
+        assert_eq!(
+            batches,
+            vec![vec![sync_start(), print("body"), soft_reset()]]
+        );
+        assert!(!batcher.is_holding());
+    }
+}
+
 fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: FileDescriptor) {
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
-    let mut actions = vec![];
-    let mut hold = false;
+    let mut batcher = SyncOutputBatcher::default();
     let mut action_size = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
     let mut deadline = None;
@@ -158,40 +317,13 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
             }
             Ok(size) => {
                 parser.parse(&buf[0..size], |action| {
-                    let mut flush = false;
-                    match &action {
-                        Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
-                            DecPrivateModeCode::SynchronizedOutput,
-                        )))) => {
-                            hold = true;
-
-                            // Flush prior actions
-                            if !actions.is_empty() {
-                                send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
-                                action_size = 0;
-                            }
-                        }
-                        Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(
-                            DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput),
-                        ))) => {
-                            hold = false;
-                            flush = true;
-                        }
-                        Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
-                            hold = false;
-                            flush = true;
-                        }
-                        _ => {}
-                    };
-                    action.append_to(&mut actions);
-
-                    if flush && !actions.is_empty() {
-                        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                    if let Some(batch) = batcher.ingest(action) {
+                        send_actions_to_mux(&pane, &dead, batch);
                         action_size = 0;
                     }
                 });
                 action_size += size;
-                if !actions.is_empty() && !hold {
+                if batcher.has_pending() && !batcher.is_holding() {
                     // If we haven't accumulated too much data,
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
@@ -221,7 +353,9 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                         }
                     }
 
-                    send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                    if let Some(batch) = batcher.take() {
+                        send_actions_to_mux(&pane, &dead, batch);
+                    }
                     deadline = None;
                     action_size = 0;
                 }
@@ -237,8 +371,8 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     // to be displayed before we return from here; this is important
     // for very short lived commands so that we don't forget to
     // display what they displayed.
-    if !actions.is_empty() {
-        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+    if let Some(batch) = batcher.take() {
+        send_actions_to_mux(&pane, &dead, batch);
     }
 }
 
