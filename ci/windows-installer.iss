@@ -198,3 +198,5 @@ begin
   if CurUninstallStep = usPostUninstall then
     EnvRemovePath(ExpandConstant('{app}'));
 end;
+
+; ci nudge
