@@ -276,6 +276,14 @@ As features stabilize some brief notes about them will accumulate here.
   a zero-sized placement (e.g. `w=0`/`h=0`), or displaying a cell-sized image on a pane
   whose pty reported no pixel dimensions (e.g. in `tmux -CC` domain).
   Such images are now refused instead of taking down the pane. Thanks to @zakrad! #6344
+* Synchronized output (DEC private mode 2026) could still flicker: actions
+  received ahead of the start of a block (typically "erase display") were
+  applied to the terminal model on their own, allowing the cleared state to
+  be rendered while the rest of the block was still in flight. Such actions
+  are now applied atomically together with the block. Additionally, a block
+  that is never released now times out after
+  `mux_output_parser_sync_timeout_ms` (default 150ms) instead of freezing
+  the pane until a soft reset. #7465
 
 #### Updated
 * Bundled conpty.dll and OpenConsole.exe to build 1.22.250204002.nupkg
