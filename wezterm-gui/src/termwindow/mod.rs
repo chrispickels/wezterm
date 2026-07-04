@@ -72,19 +72,19 @@ pub mod background;
 pub mod box_model;
 pub mod charselect;
 pub mod clipboard;
+mod cursorblink;
 pub mod keyevent;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
 pub mod paneselect;
-mod prevcursor;
 pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
-use prevcursor::PrevCursorPos;
+use cursorblink::CursorBlinkPhase;
 
 const ATLAS_SIZE: usize = 128;
 
@@ -400,7 +400,7 @@ pub struct TermWindow {
     last_mouse_coords: (usize, i64),
     window_drag_position: Option<MouseEvent>,
     current_mouse_event: Option<MouseEvent>,
-    prev_cursor: PrevCursorPos,
+    cursor_blink_phase: CursorBlinkPhase,
     last_scroll_info: RenderableDimensions,
 
     tab_state: RefCell<HashMap<TabId, TabState>>,
@@ -540,7 +540,7 @@ impl TermWindow {
         }
 
         // Reset the cursor blink phase
-        self.prev_cursor.bump();
+        self.cursor_blink_phase.reset();
 
         // force cursor to be repainted
         window.invalidate();
@@ -718,7 +718,7 @@ impl TermWindow {
             window_drag_position: None,
             current_mouse_event: None,
             current_modifier_and_leds: Default::default(),
-            prev_cursor: PrevCursorPos::new(),
+            cursor_blink_phase: CursorBlinkPhase::new(),
             last_scroll_info: RenderableDimensions::default(),
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),

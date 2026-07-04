@@ -406,6 +406,9 @@ impl super::TermWindow {
                             && !keycode.is_modifier()
                             && self.pane_state(pane.pane_id()).overlay.is_none()
                         {
+                            // The cursor should render solid while the
+                            // user is typing
+                            self.cursor_blink_phase.reset();
                             self.maybe_scroll_to_bottom_for_input(&pane);
                         }
                         if is_down
@@ -707,6 +710,9 @@ impl super::TermWindow {
                         && !key.is_modifier()
                         && self.pane_state(pane.pane_id()).overlay.is_none()
                     {
+                        // The cursor should render solid while the
+                        // user is typing
+                        self.cursor_blink_phase.reset();
                         self.maybe_scroll_to_bottom_for_input(&pane);
                     }
                     if window_key.key_is_down

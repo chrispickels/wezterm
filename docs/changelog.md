@@ -276,6 +276,11 @@ As features stabilize some brief notes about them will accumulate here.
   a zero-sized placement (e.g. `w=0`/`h=0`), or displaying a cell-sized image on a pane
   whose pty reported no pixel dimensions (e.g. in `tmux -CC` domain).
   Such images are now refused instead of taking down the pane. Thanks to @zakrad! #6344
+* The cursor blink phase was reset whenever the application moved the cursor,
+  so full-screen programs that repaint frequently (spinners, progress UIs)
+  made the cursor shimmer at the repaint rate instead of blinking at
+  `cursor_blink_rate`. The blink phase now resets on keyboard input and
+  window focus, and runs freely during application output. #2363
 
 #### Updated
 * Bundled conpty.dll and OpenConsole.exe to build 1.22.250204002.nupkg
