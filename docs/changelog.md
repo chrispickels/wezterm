@@ -284,6 +284,11 @@ As features stabilize some brief notes about them will accumulate here.
   that is never released now times out after
   `mux_output_parser_sync_timeout_ms` (default 150ms) instead of freezing
   the pane until a soft reset. #7465
+* The cursor blink phase was reset whenever the application moved the cursor,
+  so full-screen programs that repaint frequently (spinners, progress UIs)
+  made the cursor shimmer at the repaint rate instead of blinking at
+  `cursor_blink_rate`. The blink phase now resets on keyboard input and
+  window focus, and runs freely during application output. #2363
 
 #### Updated
 * Bundled conpty.dll and OpenConsole.exe to build 1.22.250204002.nupkg

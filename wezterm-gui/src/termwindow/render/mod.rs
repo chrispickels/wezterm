@@ -678,7 +678,7 @@ impl crate::TermWindow {
 
         if blinking {
             let mut color_ease = self.cursor_blink_state.borrow_mut();
-            color_ease.update_start(self.prev_cursor.last_cursor_movement());
+            color_ease.update_start(self.cursor_blink_phase.last_reset());
             let (intensity, next) = color_ease.intensity_continuous();
 
             cursor_border_mix = intensity;
