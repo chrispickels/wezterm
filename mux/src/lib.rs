@@ -148,7 +148,10 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
 #[derive(Default)]
 struct SyncOutputBatcher {
     actions: Vec<Action>,
-    holding: bool,
+    /// When a synchronized output block is active, the time at
+    /// which it began, so that a block that is never released can
+    /// be timed out rather than freezing the display.
+    holding_since: Option<Instant>,
 }
 
 impl SyncOutputBatcher {
@@ -170,16 +173,22 @@ impl SyncOutputBatcher {
                 // we wait for the remainder of the block to arrive, which
                 // manifests as flicker.
                 // <https://github.com/wezterm/wezterm/issues/7465>
-                self.holding = true;
+                //
+                // If we're already holding, keep the original start
+                // time: repeated BSUs must not postpone the timeout
+                // indefinitely.
+                if self.holding_since.is_none() {
+                    self.holding_since = Some(Instant::now());
+                }
             }
             Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
             )))) => {
-                self.holding = false;
+                self.holding_since = None;
                 flush_after = true;
             }
             Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
-                self.holding = false;
+                self.holding_since = None;
                 flush_after = true;
             }
             _ => {}
@@ -203,11 +212,24 @@ impl SyncOutputBatcher {
     }
 
     fn is_holding(&self) -> bool {
-        self.holding
+        self.holding_since.is_some()
     }
 
     fn has_pending(&self) -> bool {
         !self.actions.is_empty()
+    }
+
+    /// If a synchronized output block is active, returns the time at
+    /// which we should give up waiting for it to be released.
+    fn sync_deadline(&self, timeout: Duration) -> Option<Instant> {
+        self.holding_since.map(|since| since + timeout)
+    }
+
+    /// Stop holding (because the synchronized output block was not
+    /// released in time) and hand back whatever has accumulated.
+    fn release(&mut self) -> Option<Vec<Action>> {
+        self.holding_since = None;
+        self.take()
     }
 }
 
@@ -298,6 +320,21 @@ mod sync_output_batcher_tests {
     }
 
     #[test]
+    fn release_stops_holding_and_flushes() {
+        let mut batcher = SyncOutputBatcher::default();
+        let batches = ingest_all(&mut batcher, vec![sync_start(), print("body")]);
+        assert_eq!(batches, Vec::<Vec<Action>>::new());
+        assert!(batcher.is_holding());
+
+        assert_eq!(batcher.release(), Some(vec![sync_start(), print("body")]));
+        assert!(!batcher.is_holding());
+        assert!(!batcher.has_pending());
+
+        // Releasing with nothing pending is a no-op
+        assert_eq!(batcher.release(), None);
+    }
+
+    #[test]
     fn soft_reset_releases_hold() {
         let mut batcher = SyncOutputBatcher::default();
         let batches = ingest_all(
@@ -318,9 +355,43 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     let mut batcher = SyncOutputBatcher::default();
     let mut action_size = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
+    let mut sync_timeout = Duration::from_millis(configuration().mux_output_parser_sync_timeout_ms);
     let mut deadline = None;
 
     loop {
+        if let Some(sync_deadline) = batcher.sync_deadline(sync_timeout) {
+            // A synchronized output block is open, so we're holding
+            // its actions rather than applying them to the model.
+            // Don't wait indefinitely for the release: a program that
+            // begins a synchronized update and then stalls (or never
+            // ends the block) would otherwise freeze the display
+            // until it emits a soft reset. Wait for more data only
+            // until the deadline, then apply what we have.
+            let ready = match sync_deadline.checked_duration_since(Instant::now()) {
+                Some(remain) => {
+                    let mut pfd = [pollfd {
+                        fd: rx.as_socket_descriptor(),
+                        events: POLLIN,
+                        revents: 0,
+                    }];
+                    match poll(&mut pfd, Some(remain)) {
+                        Ok(1) => true,
+                        Ok(_) => false,
+                        // Interrupted: loop around and re-assess
+                        // the remaining time
+                        Err(_) => continue,
+                    }
+                }
+                None => false,
+            };
+            if !ready {
+                if let Some(batch) = batcher.release() {
+                    send_actions_to_mux(&pane, &dead, batch);
+                    action_size = 0;
+                }
+                continue;
+            }
+        }
         match rx.read(&mut buf) {
             Ok(size) if size == 0 => {
                 dead.store(true, Ordering::Relaxed);
@@ -378,6 +449,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                 let config = configuration();
                 buf.resize(config.mux_output_parser_buffer_size, 0);
                 delay = Duration::from_millis(config.mux_output_parser_coalesce_delay_ms);
+                sync_timeout = Duration::from_millis(config.mux_output_parser_sync_timeout_ms);
             }
         }
     }

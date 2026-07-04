@@ -411,6 +411,14 @@ pub struct Config {
     #[dynamic(default = "default_mux_output_parser_coalesce_delay_ms")]
     pub mux_output_parser_coalesce_delay_ms: u64,
 
+    /// How many ms to wait for a synchronized output block
+    /// (DEC private mode 2026) to be released before giving up and
+    /// applying the buffered output to the terminal model anyway.
+    /// This bounds how long a program that begins a synchronized
+    /// update but stalls before ending it can freeze the display.
+    #[dynamic(default = "default_mux_output_parser_sync_timeout_ms")]
+    pub mux_output_parser_sync_timeout_ms: u64,
+
     #[dynamic(default = "default_mux_env_remove")]
     pub mux_env_remove: Vec<String>,
 
@@ -1661,6 +1669,10 @@ fn default_swallow_mouse_click_on_window_focus() -> bool {
 
 fn default_mux_output_parser_coalesce_delay_ms() -> u64 {
     3
+}
+
+fn default_mux_output_parser_sync_timeout_ms() -> u64 {
+    150
 }
 
 fn default_mux_output_parser_buffer_size() -> usize {
