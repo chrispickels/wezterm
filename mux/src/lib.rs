@@ -155,16 +155,22 @@ impl SyncOutputBatcher {
     /// Accumulate an action, returning a batch of actions that
     /// should be applied to the pane now, if any.
     fn ingest(&mut self, action: Action) -> Option<Vec<Action>> {
-        let mut batch = None;
         let mut flush_after = false;
         match &action {
             Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
             )))) => {
+                // Note that we deliberately do NOT flush the actions
+                // accumulated so far: programs commonly clear the screen
+                // (or the region they are about to repaint) immediately
+                // before beginning a synchronized update, and those
+                // preparatory actions arrive in the same chunk of output.
+                // Applying them to the model now would allow the renderer
+                // to observe the cleared-but-not-yet-redrawn state while
+                // we wait for the remainder of the block to arrive, which
+                // manifests as flicker.
+                // <https://github.com/wezterm/wezterm/issues/7465>
                 self.holding = true;
-
-                // Flush prior actions
-                batch = self.take();
             }
             Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
@@ -181,9 +187,10 @@ impl SyncOutputBatcher {
         action.append_to(&mut self.actions);
 
         if flush_after {
-            batch = self.take();
+            self.take()
+        } else {
+            None
         }
-        batch
     }
 
     /// Hand back whatever has accumulated, if anything.
@@ -249,8 +256,14 @@ mod sync_output_batcher_tests {
         assert_eq!(batcher.take(), None);
     }
 
+    /// Actions that precede the start of a synchronized output block
+    /// must be applied together with the block itself: a program that
+    /// emits "erase display" immediately before beginning a
+    /// synchronized update must never have the erased-but-not-redrawn
+    /// state observable by the renderer.
+    /// <https://github.com/wezterm/wezterm/issues/7465>
     #[test]
-    fn prefix_is_flushed_when_sync_begins() {
+    fn prefix_is_held_until_sync_release() {
         let mut batcher = SyncOutputBatcher::default();
         let batches = ingest_all(
             &mut batcher,
@@ -258,10 +271,12 @@ mod sync_output_batcher_tests {
         );
         assert_eq!(
             batches,
-            vec![
-                vec![print("prefix")],
-                vec![sync_start(), print("body"), sync_end()],
-            ]
+            vec![vec![
+                print("prefix"),
+                sync_start(),
+                print("body"),
+                sync_end(),
+            ]]
         );
         assert!(!batcher.is_holding());
         assert!(!batcher.has_pending());
